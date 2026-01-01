@@ -40,7 +40,7 @@ async def main():
     # 2. Инициализация бота
     bot = Bot(
         token=config.bot_token.get_secret_value(),
-        default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+        default=DefaultBotProperties(parse_mode=None)
     )
 
     # 3. Инициализация диспетчера

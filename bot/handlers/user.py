@@ -1,116 +1,132 @@
-from typing import List, Optional
-from aiogram import Router, F, Bot
-from aiogram.types import Message
-from aiogram.filters import CommandStart
+import logging
+from aiogram import Router, F, types
+from aiogram.filters import Command
+from html.parser import HTMLParser
 
 from db.engine import async_session
 from db.requests import (
-    get_or_create_user, 
-    check_user_limit, 
-    add_photo_upload, 
-    update_user_thread, 
-    get_user_thread
+    get_or_create_user,
+    check_user_limit,
+    add_photo_upload,
+    update_user_thread,
+    get_user_thread,
 )
 from services.openai_service import ai_service
-from services.tasks import send_renewal_notification
-from core.config import config
 
 router = Router()
+logger = logging.getLogger(__name__)
 
-@router.message(CommandStart())
-async def cmd_start(message: Message):
-    """Приветствие и регистрация пользователя в БД"""
+MAX_TG_LEN = 3500  # лимит Telegram ~4096
+
+class _HTMLStripper(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.parts = []
+
+    def handle_data(self, data: str):
+        if data:
+            self.parts.append(data)
+
+    def get_text(self) -> str:
+        return "".join(self.parts)
+
+
+def strip_html(text: str) -> str:
+    s = _HTMLStripper()
+    s.feed(text or "")
+    s.close()
+    # чуть нормализуем пробелы/переносы
+    return " ".join(s.get_text().split())
+
+async def safe_delete(msg: types.Message | None):
+    if not msg:
+        return
+    try:
+        await msg.delete()
+    except Exception:
+        pass
+
+
+async def send_long(message: types.Message, text: str):
+    if not text:
+        await message.answer("⚠️ Пустой ответ от ИИ. Попробуйте ещё раз.")
+        return
+
+    text = strip_html(str(text))
+
+    for i in range(0, len(text), MAX_TG_LEN):
+        await message.answer(text[i:i + MAX_TG_LEN])
+
+
+@router.message(Command("start"))
+async def cmd_start(message: types.Message):
     async with async_session() as session:
         await get_or_create_user(session, message.from_user.id)
-    
-    welcome_text = (
-        "<b>Привет! Я твой Нейро-помощник.</b> 🎨\n\n"
-        "Отправь мне фото своей работы, и я проведу её подробный анализ.\n\n"
-        "📍 <b>Лимиты:</b>\n"
-        "— До 3-х работ в сутки.\n"
-        "— К каждой работе можно задать уточняющие вопросы.\n"
-        "— Новое фото сбрасывает контекст предыдущего обсуждения.\n\n"
-        "<i>Просто прикрепи фото к сообщению!</i>"
-    )
-    await message.answer(welcome_text, parse_mode="HTML")
+
+    await message.answer("Пришли фото своей работы.")
 
 
 @router.message(F.photo)
-async def handle_photo(message: Message, bot: Bot, album: Optional[List[Message]] = None):
-    """
-    Обработка фото или альбома. 
-    Благодаря AlbumMiddleware, 'album' содержит список сообщений медиагруппы.
-    """
+async def handle_photo(message: types.Message):
     tg_id = message.from_user.id
-    
-    async with async_session() as session:
-        # 1. Проверка лимитов (3 фото в 24 часа)
-        if not await check_user_limit(session, tg_id):
-            await message.answer(
-                "⚠️ <b>Лимит исчерпан.</b>\n"
-                "Вы уже оценили 3 работы за последние 24 часа. "
-                "Я уведомлю вас, когда возможность снова появится!",
-                parse_mode="HTML"
-            )
-            return
+    status_msg = await message.answer("Изучаю...")
 
-        status_msg = await message.answer("⏳ <i>Нейросеть изучает вашу работу... это займет несколько секунд.</i>", parse_mode="HTML")
+    try:
+        # 1) Проверка лимита + создание пользователя
+        async with async_session() as session:
+            await get_or_create_user(session, tg_id)
 
-        try:
-            # 2. Получаем ссылку на фото. 
-            # Если это альбом, берем фото из первого сообщения группы.
-            target_msg = album[0] if album else message
-            file_id = target_msg.photo[-1].file_id
-            file = await bot.get_file(file_id)
-            
-            # OpenAI скачает фото по этой ссылке
-            photo_url = f"https://api.telegram.org/file/bot{config.bot_token.get_secret_value()}/{file.file_path}"
+            if not await check_user_limit(session, tg_id):
+                await safe_delete(status_msg)
+                await message.answer("Лимит исчерпан.")
+                return
 
-            # 3. Запрос к OpenAI Assistant API (Vision)
-            # Метод analyze_photo всегда создает НОВЫЙ тред (сброс контекста)
-            thread_id, response_text = await ai_service.analyze_photo(photo_url)
+        # 2) Фото -> URL
+        photo = message.photo[-1]
+        file = await message.bot.get_file(photo.file_id)
+        photo_url = f"https://api.telegram.org/file/bot{message.bot.token}/{file.file_path}"
 
-            # 4. Обновление данных в БД
-            await update_user_thread(session, tg_id, thread_id)
+        # 3) Анализ фото (ВАЖНО: без thread_id)
+        new_thread_id, response_text = await ai_service.analyze_photo(photo_url)
+
+        # 4) Сохранение thread + счетчик
+        async with async_session() as session:
+            await update_user_thread(session, tg_id, new_thread_id)
             await add_photo_upload(session, tg_id)
 
-            # 5. Планируем уведомление через Celery на +24 часа
-            send_renewal_notification.apply_async(args=[tg_id], countdown=86400)
+        # 5) Удаляем статус и отправляем ответ
+        await safe_delete(status_msg)
+        await send_long(message, response_text)
 
-            # 6. Ответ пользователю
-            await status_msg.delete()
-            await message.answer(response_text, parse_mode="HTML")
-
-        except Exception as e:
-            await status_msg.edit_text("❌ Произошла ошибка при анализе фото. Попробуйте позже.")
-            # Здесь можно добавить логирование ошибки: logger.error(e)
+    except Exception:
+        logger.exception("Ошибка в handle_photo")
+        await safe_delete(status_msg)
+        await message.answer("❌ Произошла ошибка при анализе фото. Попробуйте позже.")
 
 
-@router.message(F.text)
-async def handle_text(message: Message):
-    """Обработка уточняющих вопросов (текстовые сообщения)"""
+@router.message(F.text & ~F.command)
+async def handle_text(message: types.Message):
     tg_id = message.from_user.id
-    
-    # Игнорируем команды
-    if message.text.startswith("/"):
-        return
+    status_msg = await message.answer("Думаю...")
 
-    async with async_session() as session:
-        thread_id = await get_user_thread(session, tg_id)
-        
-        # Если thread_id нет, значит фото еще не присылали или лимит сброшен
+    try:
+        # 1) Берём thread_id
+        async with async_session() as session:
+            thread_id = await get_user_thread(session, tg_id)
+
         if not thread_id:
-            await message.answer("📸 <b>Сначала отправьте фото работы!</b>\nЯ смогу ответить на вопросы только после анализа изображения.", parse_mode="HTML")
+            await safe_delete(status_msg)
+            await message.answer("Сначала пришли фото, чтобы я создал контекст.")
             return
 
-        status_msg = await message.answer("🤔 <i>Пишу ответ...</i>", parse_mode="HTML")
+        # 2) Follow-up
+        response_text = await ai_service.ask_follow_up(thread_id, message.text)
 
-        try:
-            # Отправляем текст в существующий поток (сохранение контекста текущей работы)
-            response_text = await ai_service.ask_follow_up(thread_id, message.text)
-            
-            await status_msg.delete()
-            await message.answer(response_text, parse_mode="HTML")
-            
-        except Exception as e:
-            await status_msg.edit_text("❌ Не удалось получить ответ от ассистента.")
+        # 3) Удаляем статус и отправляем ответ
+        await safe_delete(status_msg)
+        await send_long(message, response_text)
+
+    except Exception:
+        logger.exception("Ошибка в handle_text")
+        await safe_delete(status_msg)
+        await message.answer("❌ Ошибка при обработке запроса. Попробуйте позже.")
